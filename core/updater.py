@@ -90,9 +90,12 @@ def check_for_update(silent: bool = False) -> tuple[bool, str, Optional[dict]]:
 
 
 def _find_exe_asset(release: dict) -> Optional[dict]:
-    """Ищет .exe файл в ассетах релиза."""
+    """Ищет .exe файл клиента в ассетах релиза (НЕ sing-box.exe)."""
     for asset in release.get("assets", []):
         name = asset.get("name", "")
+        # Пропускаем sing-box.exe — это ядро, не клиент
+        if name.lower() == "sing-box.exe":
+            continue
         if name.endswith(".exe"):
             return asset
     return None

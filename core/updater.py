@@ -1,11 +1,10 @@
 """
 Auto-updater — проверка и установка обновлений через GitHub Releases.
 
-Механика (как в CISChecker v1.2.0):
-  1. GET /repos/{owner}/{repo}/releases/latest
-  2. Сравниваем tag_name (v1.2.3) с APP_VERSION (1.0.0)
-  3. Если новее — скачиваем .exe ассет
-  4. Запускаем новый exe и завершаем текущий процесс
+v1.2.0 — механизм самообновления через временный .bat файл:
+  1. Скачиваем новый .exe рядом как app_new.exe
+  2. Генерируем updater.bat (ждёт 2 сек, удаляет старый, переименовывает новый, запускает)
+  3. Запускаем updater.bat и выходим (sys.exit)
 """
 
 import json
@@ -46,7 +45,6 @@ def compare_versions(current: str, latest: str) -> int:
     """
     cv = _parse_semver(current)
     lv = _parse_semver(latest)
-    # Дополняем нулями до одинаковой длины
     max_len = max(len(cv), len(lv))
     cv = cv + (0,) * (max_len - len(cv))
     lv = lv + (0,) * (max_len - len(lv))
@@ -100,10 +98,30 @@ def _find_exe_asset(release: dict) -> Optional[dict]:
     return None
 
 
+def _get_own_exe_path() -> Optional[Path]:
+    """Возвращает абсолютный путь к текущему .exe (или None если не заморожен)."""
+    if getattr(sys, 'frozen', False):
+        return Path(sys.executable)
+    return None
+
+
 def download_and_install(release: dict, progress_callback=None) -> tuple[bool, str]:
     """
-    Скачивает .exe из релиза и запускает его.
-    progress_callback(percent: int)
+    Скачивает новый .exe, генерирует updater.bat и запускает self-обновление.
+
+    Алгоритм:
+      1. Скачать новый .exe → <current_dir>/SingBoxGUI_new.exe
+      2. Создать <current_dir>/updater.bat:
+           @echo off
+           timeout /t 2 /nobreak >nul
+           del /f /q "SingBoxGUI.exe"
+           ren "SingBoxGUI_new.exe" "SingBoxGUI.exe"
+           start "" "SingBoxGUI.exe"
+           del "%~f0"
+      3. Запустить updater.bat (DETACHED_PROCESS)
+      4. Вернуть (True, ...) — вызывающая сторона делает sys.exit()
+
+    progress_callback(percent: int) — опционально.
     """
     asset = _find_exe_asset(release)
     if not asset:
@@ -114,16 +132,29 @@ def download_and_install(release: dict, progress_callback=None) -> tuple[bool, s
         return False, "No download URL"
 
     size = asset.get("size", 0)
-    tmp_dir = Path(tempfile.gettempdir()) / "sing-box-gui-update"
-    tmp_dir.mkdir(exist_ok=True)
-    dest = tmp_dir / asset["name"]
+    asset_name = asset["name"]
 
+    # Куда сохраняем: рядом с текущим exe
+    own_exe = _get_own_exe_path()
+    if own_exe:
+        target_dir = own_exe.parent
+        current_name = own_exe.name
+    else:
+        # Dev mode — кладём в temp
+        target_dir = Path(tempfile.gettempdir()) / "sing-box-gui-update"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        current_name = asset_name
+
+    new_exe = target_dir / f"{Path(current_name).stem}_new.exe"
+    bat_path = target_dir / "updater.bat"
+
+    # ── Скачивание ──
     try:
         req = Request(download_url)
         req.add_header("User-Agent", f"{version.APP_NAME}/{version.APP_VERSION}")
-        with urlopen(req, timeout=120) as resp:
+        with urlopen(req, timeout=300) as resp:
             downloaded = 0
-            with open(dest, "wb") as f:
+            with open(new_exe, "wb") as f:
                 while True:
                     chunk = resp.read(8192)
                     if not chunk:
@@ -135,21 +166,41 @@ def download_and_install(release: dict, progress_callback=None) -> tuple[bool, s
     except Exception as e:
         return False, f"Download failed: {e}"
 
-    # Запускаем новый exe
+    # ── Генерация updater.bat ──
+    # Кодируем пути: кавычки для пробелов в путях
+    bat_content = f"""@echo off
+timeout /t 2 /nobreak >nul
+del /f /q "{current_name}"
+ren "{new_exe.name}" "{current_name}"
+start "" "{current_name}"
+del "%~f0"
+"""
     try:
-        subprocess.Popen(
-            [str(dest)],
-            creationflags=0x00000008 if sys.platform == "win32" else 0,
-        )
+        bat_path.write_text(bat_content, encoding="ascii")
     except Exception as e:
-        return False, f"Failed to launch installer: {e}"
+        return False, f"Failed to create updater.bat: {e}"
 
-    return True, f"Launching {asset['name']}..."
+    # ── Запуск bat и выход ──
+    try:
+        if sys.platform == "win32":
+            # DETACHED_PROCESS = 0x00000008 — bat живёт независимо
+            subprocess.Popen(
+                [str(bat_path)],
+                creationflags=0x00000008,
+                cwd=str(target_dir),
+                shell=True,
+            )
+        else:
+            # На Linux/macOS — просто запускаем новый (не поддерживается самообновление)
+            subprocess.Popen([str(new_exe)])
+    except Exception as e:
+        return False, f"Failed to launch updater: {e}"
+
+    return True, f"Update downloaded. Restarting..."
 
 
 def background_check():
     """Фоновая проверка при запуске (с кэшированием на 24ч)."""
-    # Читаем кэш
     try:
         if UPDATE_CACHE_FILE.exists():
             import time
@@ -160,7 +211,6 @@ def background_check():
         pass
 
     has_update, msg, release = check_for_update(silent=True)
-    # Обновляем кэш
     UPDATE_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
     UPDATE_CACHE_FILE.touch()
 

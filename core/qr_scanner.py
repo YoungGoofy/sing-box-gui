@@ -1,9 +1,8 @@
 """
 QR Scanner — считывание QR-кодов с экрана или из буфера обмена.
 
-Использует pyzbar для декодирования QR + PIL для захвата скриншота.
-При ошибках (отсутствие DLL в PyInstaller-сборке) возвращает None
-с читаемым сообщением вместо краша.
+Использует cv2.QRCodeDetector как основной декодер (надёжнее в PyInstaller-сборках).
+pyzbar — резервный fallback.
 """
 
 import sys
@@ -71,16 +70,38 @@ def scan_from_file(file_path: str) -> Tuple[Optional[str], Optional[str]]:
 
 def _safe_decode(img) -> Tuple[Optional[str], Optional[str]]:
     """
-    Пытается декодировать QR через pyzbar, затем OpenCV.
+    Декодирует QR-код: сначала OpenCV (cv2.QRCodeDetector), затем pyzbar.
+    OpenCV надёжнее в PyInstaller-сборках (нет проблем с DLL).
     Возвращает (text, error_message). Если QR не найден — (None, None).
     """
-    # ── Попытка 1: pyzbar ──
+    _pyzbar_error = None
+
+    # ── Попытка 1: OpenCV (cv2.QRCodeDetector) ──
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        pass  # Try pyzbar next
+    except Exception as e:
+        return None, f"OpenCV error: {e}"
+    else:
+        try:
+            arr = np.array(img.convert("RGB"))
+            arr_bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+            detector = cv2.QRCodeDetector()
+            data, points, _ = detector.detectAndDecode(arr_bgr)
+            if data and points is not None:
+                return data, None
+        except Exception as e:
+            _pyzbar_error = f"OpenCV decode error: {e}"
+
+    # ── Попытка 2: pyzbar ──
     try:
         from pyzbar.pyzbar import decode as zbar_decode
     except ImportError:
-        pass
+        pass  # Neither available — report error
     except OSError as e:
-        # This catches DLL loading errors in PyInstaller builds
+        # DLL loading errors in PyInstaller builds
         msg = str(e)
         if "dynlib" in msg.lower() or "dll" in msg.lower() or "libiconv" in msg.lower():
             return None, (
@@ -100,38 +121,19 @@ def _safe_decode(img) -> Tuple[Optional[str], Optional[str]]:
                     data = data.decode("utf-8", errors="replace")
                 return data, None
         except Exception as e:
-            # pyzbar loaded but decode failed — try OpenCV
-            pass
+            _pyzbar_error = f"pyzbar decode error: {e}"
 
-    # ── Попытка 2: OpenCV ──
-    try:
-        import cv2
-        import numpy as np
-    except ImportError:
-        # Neither decoder available
-        return None, (
-            "No QR decoder available. Install one of:\n"
-            "  pip install pyzbar\n"
-            "  pip install opencv-python"
-        )
-    except Exception as e:
-        return None, f"OpenCV error: {e}"
-
-    try:
-        arr = np.array(img.convert("RGB"))
-        arr_bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-        detector = cv2.QRCodeDetector()
-        data, _, _ = detector.detectAndDecode(arr_bgr)
-        if data:
-            return data, None
-    except Exception as e:
-        return None, f"OpenCV decode error: {e}"
-
-    # No QR found — not an error, just nothing
-    return None, None
+    # Neither decoder found or both failed
+    if _pyzbar_error:
+        return None, _pyzbar_error
+    return None, (
+        "No QR decoder available. Install one of:\n"
+        "  pip install opencv-python\n"
+        "  pip install pyzbar"
+    )
 
 
-# ── Backward-compatible wrappers (for old callers) ──
+# ── Backward-compatible wrappers ──
 
 def scan_from_screen_snippet() -> Optional[str]:
     """Legacy: returns decoded string or None (no error detail)."""

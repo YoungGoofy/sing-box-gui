@@ -26,16 +26,7 @@ jobs:
 
       - name: Download sing-box core
         run: |
-          # Get latest sing-box release download URL for windows-amd64
-          for i in 1 2 3; do
-            URL=$(curl -sL "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | python -c "import sys,json; assets=json.load(sys.stdin)['assets']; print([a['browser_download_url'] for a in assets if 'windows-amd64' in a['name'] and a['name'].endswith('.zip')][-1])" 2>/dev/null)
-            if [ -n "$URL" ]; then break; fi
-            sleep 2
-          done
-          echo "Downloading: $URL"
-          curl -L -o sing-box.zip "$URL"
-          7z x sing-box.zip -osing-box-tmp
-          move sing-box-tmp\sing-box.exe .
+          python scripts/download_singbox.py .
 
       - name: Build with PyInstaller
         run: |

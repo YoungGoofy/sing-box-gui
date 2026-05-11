@@ -13,6 +13,8 @@ from tkinter import filedialog, messagebox
 from typing import Optional
 
 import customtkinter as ctk
+import pystray
+from PIL import Image, ImageDraw, ImageFont
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from core.config_manager import ConfigManager, Profile
@@ -440,7 +442,10 @@ class SingBoxApp(ctk.CTk):
         self._build_sidebar()
         self._build_main()
         self._refresh_profile_list()
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        # ── Tray icon ──
+        self.tray_icon: Optional[pystray.Icon] = None
+        self.tray_thread: Optional[threading.Thread] = None
+        self.protocol("WM_DELETE_WINDOW", self.hide_window)
 
         # ── Admin check ──
         if not is_admin():
@@ -1000,17 +1005,112 @@ class SingBoxApp(ctk.CTk):
             messagebox.showerror("Update Failed", msg)
 
     # ═══════════════════════════════════════════════════════
-    #  Close
+    #  Close / System Tray
     # ═══════════════════════════════════════════════════════
 
+    def hide_window(self):
+        """Скрыть окно и свернуть в трей (вызывается по WM_DELETE_WINDOW)."""
+        self.withdraw()
+        if self.tray_icon is None:
+            self._start_tray()
+
+    def _start_tray(self):
+        """Запускает иконку в трее в отдельном потоке."""
+        if self.tray_thread is not None and self.tray_thread.is_alive():
+            return
+        image = self._create_tray_image()
+        menu = pystray.Menu(
+            pystray.MenuItem("Развернуть", self._show_window, default=True),
+            pystray.MenuItem("Остановить VPN", self._tray_stop_vpn),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Выход", self._quit_app),
+        )
+        self.tray_icon = pystray.Icon(
+            "SingBoxGUI", image, "Sing-Box GUI", menu,
+        )
+        self.tray_thread = threading.Thread(target=self.tray_icon.run, daemon=True)
+        self.tray_thread.start()
+
+    def _create_tray_image(self) -> Image.Image:
+        """Генерирует иконку для трея (16x16 или 32x32) через Pillow."""
+        size = 32
+        img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+
+        # Заливка: окружность Catppuccin Blue
+        pad = 2
+        draw.ellipse([pad, pad, size - pad, size - pad],
+                     fill=CAT_BLUE, outline=CAT_SAPPHIRE, width=1)
+
+        # Буква S
+        try:
+            font = ImageFont.truetype("segoeui.ttf", 18)
+        except OSError:
+            font = ImageFont.load_default()
+        bbox = draw.textbbox((0, 0), "S", font=font)
+        text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
+        x = (size - text_w) // 2
+        y = (size - text_h) // 2 - 1
+        draw.text((x, y), "S", fill=CAT_CRUST, font=font)
+        return img
+
+    def _show_window(self, icon=None, item=None):
+        """Восстановить окно из трея (безопасно для потоков через after)."""
+        def _restore():
+            self.deiconify()
+            self.lift()          # поднять наверх
+            self.focus_force()   # вернуть фокус
+            self._stop_tray()
+        self.after(0, _restore)
+
+    def _tray_stop_vpn(self, icon=None, item=None):
+        """Остановить sing-box, не закрывая приложение."""
+        def _stop():
+            if self.proc_mgr.running:
+                self.proc_mgr.stop()
+                self._log("VPN остановлен (из трея).", color=CAT_PEACH)
+            else:
+                self._log("VPN не запущен.", color=CAT_TEXT_MUTED)
+        self.after(0, _stop)
+
+    def _quit_app(self, icon=None, item=None):
+        """Полный выход: убить sing-box, удалить иконку трея, sys.exit."""
+        def _quit():
+            # Отменить таймер авто-рефреша
+            if self._auto_refresh_timer_id is not None:
+                self.after_cancel(self._auto_refresh_timer_id)
+                self._auto_refresh_timer_id = None
+
+            # Жёсткое завершение sing-box
+            if self.proc_mgr.running:
+                self.proc_mgr.stop()
+            # Двойная проверка через terminate/kill в stop() уже есть,
+            # но на всякий случай делаем повторную попытку
+            try:
+                if self.proc_mgr._process is not None:
+                    self.proc_mgr._process.kill()
+                    self.proc_mgr._process.wait(timeout=3)
+            except Exception:
+                pass
+
+            self._stop_tray()
+            self.destroy()
+        self.after(0, _quit)
+
+    def _stop_tray(self):
+        """Останавливает иконку трея и очищает состояние."""
+        if self.tray_icon is not None:
+            try:
+                self.tray_icon.stop()
+            except Exception:
+                pass
+            self.tray_icon = None
+        self.tray_thread = None
+
     def _on_close(self):
-        # Отменить таймер авто-рефреша
-        if self._auto_refresh_timer_id is not None:
-            self.after_cancel(self._auto_refresh_timer_id)
-            self._auto_refresh_timer_id = None
-        if self.proc_mgr.running:
-            self.proc_mgr.stop()
-        self.destroy()
+        """Явное завершение (вызывается из updater/меню, не из WM_DELETE_WINDOW)."""
+        self._quit_app()
 
 
 def run():

@@ -24,16 +24,19 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      # Опционально: скачать sing-box.exe и положить в корень
-      # - name: Download sing-box core
-      #   run: |
-      #     curl -L -o sing-box.zip "https://github.com/SagerNet/sing-box/releases/download/v1.11.0/sing-box-windows-amd64.zip"
-      #     7z x sing-box.zip -osing-box-tmp
-      #     move sing-box-tmp\sing-box.exe .
+      - name: Download sing-box core
+        run: |
+          curl -L -o sing-box.zip "https://github.com/SagerNet/sing-box/releases/download/v1.11.0/sing-box-windows-amd64.zip"
+          7z x sing-box.zip -osing-box-tmp
+          move sing-box-tmp\sing-box.exe .
 
       - name: Build with PyInstaller
         run: |
           pyinstaller sing-box-gui.spec
+
+      - name: Copy sing-box next to EXE
+        run: |
+          copy sing-box.exe dist\sing-box.exe
 
       - name: List output
         run: |
@@ -43,13 +46,17 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: SingBoxGUI
-          path: dist/SingBoxGUI.exe
+          path: |
+            dist/SingBoxGUI.exe
+            dist/sing-box.exe
 
       - name: Release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/v')
         with:
-          files: dist/SingBoxGUI.exe
+          files: |
+            dist/SingBoxGUI.exe
+            dist/sing-box.exe
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

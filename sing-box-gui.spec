@@ -19,9 +19,7 @@ a = Analysis(
     pathex=[str(_root)],
     binaries=[],
     datas=[
-        # Бандлим sing-box.exe, если лежит в корне или vendor/
-        *([(str(_root / 'sing-box.exe'), '.')] if (_root / 'sing-box.exe').exists() else []),
-        *([(str(_root / 'vendor' / 'sing-box.exe'), 'vendor')] if (_root / 'vendor' / 'sing-box.exe').exists() else []),
+        # sing-box.exe кладётся отдельным файлом рядом с EXE (копируется на этапе CI)
     ],
     hiddenimports=[
         # CustomTkinter

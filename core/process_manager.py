@@ -2,6 +2,7 @@
 Process Manager — управление процессом sing-box.exe.
 
 Запуск/остановка, захват stdout/stderr, мониторинг состояния.
+Путь к sing-box передаётся явно при создании (из настроек). Никакого авто-поиска.
 """
 
 import os
@@ -10,17 +11,14 @@ import subprocess
 import sys
 import threading
 import time
-from pathlib import Path
 from typing import Callable, Optional
 
 
 class ProcessManager:
     """Управляет жизненным циклом sing-box."""
 
-    SING_BOX_EXE = "sing-box.exe" if sys.platform == "win32" else "sing-box"
-
-    def __init__(self, sing_box_path: Optional[str] = None):
-        self.sing_box_path = sing_box_path or self._find_sing_box()
+    def __init__(self, sing_box_path: str = "sing-box.exe"):
+        self.sing_box_path = sing_box_path
         self._process: Optional[subprocess.Popen] = None
         self._running = False
         self._log_lines: list[str] = []
@@ -29,24 +27,25 @@ class ProcessManager:
         self._reader_thread: Optional[threading.Thread] = None
         self._config_path: str = ""
 
+    def set_sing_box_path(self, path: str):
+        """Обновить путь к бинарнику (из настроек)."""
+        self.sing_box_path = path
+
     def set_log_callback(self, cb: Callable[[str], None]):
-        """Коллбэк для каждой новой строки лога."""
         self._log_callback = cb
 
     def set_state_callback(self, cb: Callable[[bool, str], None]):
-        """Коллбэк при изменении состояния (is_running, message)."""
         self._state_callback = cb
 
     def start(self, config_path: str) -> bool:
-        """
-        Запускает sing-box с указанным конфигом.
-        Возвращает True если процесс запущен.
-        """
+        """Запускает sing-box с указанным конфигом."""
         if self._running:
             self.stop()
 
         if not os.path.exists(self.sing_box_path):
-            self._emit_state(False, f"sing-box binary not found: {self.sing_box_path}")
+            self._emit_state(False,
+                             f"sing-box binary not found: {self.sing_box_path}\n"
+                             f"Go to Settings and set the correct path.")
             return False
 
         config_path = os.path.abspath(config_path)
@@ -60,8 +59,7 @@ class ProcessManager:
         try:
             creationflags = 0
             if sys.platform == "win32":
-                # CREATE_NO_WINDOW = 0x08000000 — без консольного окна
-                creationflags = 0x08000000
+                creationflags = 0x08000000  # CREATE_NO_WINDOW
 
             self._process = subprocess.Popen(
                 [self.sing_box_path, "run", "-c", config_path],
@@ -74,35 +72,36 @@ class ProcessManager:
                 creationflags=creationflags if sys.platform == "win32" else 0,
                 bufsize=1,
             )
+        except PermissionError:
+            self._emit_state(False,
+                             "Permission denied. sing-box needs Administrator rights for TUN.\n"
+                             "Restart the app as Administrator.")
+            self._process = None
+            return False
         except Exception as e:
             self._emit_state(False, f"Failed to start sing-box: {e}")
             self._process = None
             return False
 
         self._running = True
-        self._emit_state(True, f"sing-box started with config: {os.path.basename(config_path)}")
+        self._emit_state(True, f"sing-box started")
 
-        # Поток для чтения логов
         self._reader_thread = threading.Thread(target=self._read_output, daemon=True)
         self._reader_thread.start()
 
-        # Даём секунду — если сразу упал, ловим
         time.sleep(1.0)
         if self._process is not None and self._process.poll() is not None:
             rc = self._process.returncode
             self._running = False
-            self._emit_state(False, f"sing-box exited immediately (code {rc})")
+            self._emit_state(False, f"sing-box exited (code {rc})")
             return False
 
         return True
 
     def stop(self):
-        """Останавливает sing-box."""
         if not self._process:
             self._running = False
             return
-
-        self._emit_state(False, "Stopping sing-box...")
 
         try:
             if sys.platform == "win32":
@@ -112,7 +111,6 @@ class ProcessManager:
         except Exception:
             pass
 
-        # Ждём не более 5 секунд
         try:
             self._process.wait(timeout=5)
         except subprocess.TimeoutExpired:
@@ -127,7 +125,6 @@ class ProcessManager:
         self._emit_state(False, "sing-box stopped")
 
     def restart(self, config_path: str = "") -> bool:
-        """Перезапуск (с тем же или новым конфигом)."""
         if not config_path:
             config_path = self._config_path
         self.stop()
@@ -149,10 +146,7 @@ class ProcessManager:
     def config_path(self) -> str:
         return self._config_path
 
-    # ── Internals ─────────────────────────────────────────
-
     def _read_output(self):
-        """Читает вывод sing-box построчно в фоновом потоке."""
         if not self._process or not self._process.stdout:
             return
         try:
@@ -167,40 +161,15 @@ class ProcessManager:
         except (ValueError, OSError):
             pass
         finally:
-            # Процесс завершился — проверяем
             if self._process is not None:
                 rc = self._process.poll()
                 if rc is not None and rc != 0:
                     self._emit_state(False, f"sing-box exited with code {rc}")
                 elif rc == 0:
-                    pass  # нормальное завершение
+                    pass
                 self._running = False
 
     def _emit_state(self, running: bool, message: str):
         self._running = running
         if self._state_callback:
             self._state_callback(running, message)
-
-    @staticmethod
-    def _find_sing_box() -> str:
-        """Ищет sing-box.exe в PATH и рядом с приложением."""
-        # 1. Рядом с main.py / exe
-        candidates = [
-            Path(sys.executable).parent / "sing-box.exe",
-            Path(sys.argv[0]).parent / "sing-box.exe" if sys.argv else Path("."),
-            Path.cwd() / "sing-box.exe",
-            Path.cwd() / "bin" / "sing-box.exe",
-            Path(os.environ.get("APPDATA", "")) / "sing-box-gui" / "sing-box.exe",
-        ]
-
-        for c in candidates:
-            if c.exists():
-                return str(c.resolve())
-
-        # 2. PATH
-        import shutil
-        found = shutil.which("sing-box") or shutil.which("sing-box.exe")
-        if found:
-            return found
-
-        return "sing-box.exe"  # fallback — пусть пользователь положит рядом

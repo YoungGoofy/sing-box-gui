@@ -2,7 +2,8 @@
 URI Parser — декодирование sing-box:// ссылок и share-форматов в JSON конфиг.
 
 Поддерживаемые форматы:
-  - sing-box:// (custom) — base64-encoded JSON
+  - sing-box://import-remote-profile?url=...      → HTTP GET, загрузить JSON
+  - sing-box://base64json                          → base64-encoded JSON конфиг
   - vless://uuid@host:port?params#name
   - vmess:// (base64 JSON)
   - ss:// (base64 + URI)
@@ -13,10 +14,10 @@ URI Parser — декодирование sing-box:// ссылок и share-фо
 
 import base64
 import json
-import re
 from dataclasses import dataclass, field
 from typing import Optional
 from urllib.parse import parse_qs, unquote, urlparse
+from urllib.request import Request, urlopen
 
 
 @dataclass
@@ -74,22 +75,73 @@ def parse_uri(uri: str) -> ParsedProfile:
 
 
 def _parse_singbox_uri(uri: str) -> ParsedProfile:
-    """sing-box://base64json#Name"""
+    """
+    sing-box://import-remote-profile?url=...  → HTTP GET → JSON конфиг
+    sing-box://base64string                   → base64-encoded JSON конфиг
+    """
+
+    # ── remote profile import ──
+    if "import-remote-profile" in uri:
+        u = urlparse(uri)
+        qs = parse_qs(u.query)
+        remote_url = qs.get("url", [""])[0]
+        if not remote_url:
+            raise ValueError("import-remote-profile: no 'url' parameter")
+
+        remote_url = unquote(remote_url)
+        # Get fragment as profile name
+        name = unquote(u.fragment) if u.fragment else "Remote Profile"
+        name = name[:64]
+
+        # HTTP GET
+        try:
+            req = Request(remote_url)
+            req.add_header("User-Agent", "SingBoxGUI/1.0")
+            req.add_header("Accept", "application/json")
+            with urlopen(req, timeout=30) as resp:
+                raw = resp.read()
+            data = json.loads(raw)
+        except Exception as e:
+            raise ValueError(f"import-remote-profile: failed to fetch {remote_url}: {e}")
+
+        if not isinstance(data, dict):
+            raise ValueError(f"import-remote-profile: response is not a JSON object")
+
+        pp = ParsedProfile(protocol="custom", name=name)
+        pp.extra["raw_config"] = data
+        # Try to extract server/port from first outbound
+        outbounds = data.get("outbounds", [])
+        if outbounds and isinstance(outbounds[0], dict):
+            ob = outbounds[0]
+            pp.protocol = ob.get("type", "custom")
+            pp.server = ob.get("server", "")
+            pp.port = ob.get("server_port", 0)
+        return pp
+
+    # ── base64-encoded JSON ──
     b64 = uri[len("sing-box://"):]
     if "#" in b64:
         b64, name = b64.rsplit("#", 1)
     else:
         name = "Imported"
-    try:
-        raw = base64.urlsafe_b64decode(b64 + "==")
-        data = json.loads(raw)
-    except Exception:
-        raw = base64.b64decode(b64)
-        data = json.loads(raw)
 
-    pp = ParsedProfile(protocol="custom", name=name[:64])
-    pp.extra["raw_config"] = data
-    return pp
+    for decoder in (lambda s: base64.urlsafe_b64decode(s + "=="),
+                     lambda s: base64.b64decode(s)):
+        try:
+            raw = decoder(b64)
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                continue
+            pp = ParsedProfile(protocol="custom", name=name[:64])
+            pp.extra["raw_config"] = data
+            return pp
+        except Exception:
+            continue
+
+    raise ValueError(
+        f"sing-box:// URI is not import-remote-profile and could not be decoded as base64-JSON. "
+        f"Got: {uri[:80]}..."
+    )
 
 
 def _parse_vless_uri(uri: str) -> ParsedProfile:
@@ -108,7 +160,6 @@ def _parse_vless_uri(uri: str) -> ParsedProfile:
     pp.tls_server_name = qs.get("sni", [""])[0]
     pp.tls_insecure = qs.get("allowInsecure", ["0"])[0] in ("1", "true")
 
-    # Transport
     tp = qs.get("type", ["tcp"])[0]
     pp.transport = tp
     if tp == "ws":
@@ -123,7 +174,6 @@ def _parse_vless_uri(uri: str) -> ParsedProfile:
         if "host" in qs:
             pp.transport_opts["host"] = qs["host"][0]
 
-    # TLS / Reality
     security = qs.get("security", [""])[0] if "security" in qs else ""
     if security == "reality":
         pp.tls_enabled = True
@@ -132,9 +182,8 @@ def _parse_vless_uri(uri: str) -> ParsedProfile:
     elif security == "tls":
         pp.tls_enabled = True
     elif pp.port == 443:
-        pp.tls_enabled = True  # вероятно
+        pp.tls_enabled = True
 
-    # ALPN
     if "alpn" in qs:
         pp.alpn = qs["alpn"][0].split(",")
 
@@ -163,7 +212,6 @@ def _parse_vmess_uri(uri: str) -> ParsedProfile:
     pp.tls_server_name = data.get("sni", "")
     pp.tls_insecure = data.get("allowInsecure", False)
 
-    # Transport
     net = data.get("net", "tcp")
     pp.transport = net
     if net == "ws":
@@ -201,7 +249,7 @@ def _parse_trojan_uri(uri: str) -> ParsedProfile:
     pp.password = u.username or ""
     pp.name = unquote(u.fragment) if u.fragment else f"{pp.server}:{pp.port}"
     pp.name = pp.name[:64]
-    pp.tls_enabled = True  # Trojan почти всегда TLS
+    pp.tls_enabled = True
     qs = parse_qs(u.query)
     pp.tls_server_name = qs.get("sni", [""])[0]
     pp.tls_insecure = qs.get("allowInsecure", ["0"])[0] in ("1", "true")

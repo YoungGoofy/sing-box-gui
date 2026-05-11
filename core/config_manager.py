@@ -1,18 +1,20 @@
 """
 Config Manager — управление профилями (CRUD, импорт, хранение в JSON-файле).
+
+Валидация конфигов НЕ производится — всё, что пользователь импортирует,
+сохраняется как есть и передаётся sing-box. Ошибки ловятся из stdout/stderr
+самого sing-box.
 """
 
 import json
 import os
-import shutil
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from .config_validator import auto_fix_config, validate_json_string, ValidationResult
-from .uri_parser import parse_uri_to_config, ParsedProfile
+from .uri_parser import parse_uri_to_config
 
 
 @dataclass
@@ -40,20 +42,35 @@ class Profile:
             self.updated = now
 
     def to_dict(self) -> dict:
-        d = asdict(self)
-        return d
+        return asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict) -> "Profile":
-        return cls(**{
-            k: d.get(k, v.default if v.default is not field(default) else
-                    (v.default_factory() if v.default_factory is not field(lambda: {}) else None))
-            for k, v in cls.__dataclass_fields__.items()
-        } | d)
+        return cls(**{k: d.get(k, (
+            v.default if v.default is not field(default) else (
+                v.default_factory() if v.default_factory is not field(
+                    lambda: {}) else None
+            )
+        )) for k, v in cls.__dataclass_fields__.items()} | d)
+
+
+@dataclass
+class AppSettings:
+    """Глобальные настройки приложения."""
+    sing_box_path: str = "sing-box.exe"
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "AppSettings":
+        defaults = {k: v.default for k, v in cls.__dataclass_fields__.items()
+                    if v.default is not field(default)}
+        return cls(**{**defaults, **d})
 
 
 class ConfigManager:
-    """Менеджер профилей — чтение/запись из profiles.json."""
+    """Менеджер профилей + настроек — чтение/запись из profiles.json и settings.json."""
 
     def __init__(self, data_dir: str = ""):
         if not data_dir:
@@ -64,10 +81,13 @@ class ConfigManager:
         self.config_dir = self.data_dir / "configs"
         self.config_dir.mkdir(exist_ok=True)
         self.profiles_file = self.data_dir / "profiles.json"
+        self.settings_file = self.data_dir / "settings.json"
         self._profiles: list[Profile] = []
+        self._settings: AppSettings = AppSettings()
         self._load()
+        self._load_settings()
 
-    # ── CRUD ──────────────────────────────────────────────
+    # ── Profiles CRUD ────────────────────────────────────
 
     @property
     def profiles(self) -> list[Profile]:
@@ -80,14 +100,12 @@ class ConfigManager:
         return None
 
     def add(self, profile: Profile) -> Profile:
-        """Добавляет профиль и сохраняет его конфиг в отдельный файл."""
         self._profiles.append(profile)
         self._save_config_file(profile)
         self._save()
         return profile
 
     def update(self, profile_id: str, **kwargs) -> Optional[Profile]:
-        """Обновляет поля профиля."""
         p = self.get(profile_id)
         if not p:
             return None
@@ -105,35 +123,37 @@ class ConfigManager:
         if not p:
             return False
         self._profiles.remove(p)
-        # Удаляем файл конфига
         cf = self.config_dir / f"{profile_id}.json"
         if cf.exists():
             cf.unlink()
         self._save()
         return True
 
-    def set_active(self, profile_id: str):
-        """Помечает профиль как последний использованный."""
-        for p in self._profiles:
-            p.updated = (datetime.now().isoformat()
-                         if p.id == profile_id else p.updated)
-        self._save()
+    # ── Settings ─────────────────────────────────────────
 
-    # ── Импорт ────────────────────────────────────────────
+    @property
+    def settings(self) -> AppSettings:
+        return self._settings
+
+    def save_settings(self, **kwargs):
+        """Сохраняет переданные поля в settings.json."""
+        for k, v in kwargs.items():
+            if hasattr(self._settings, k):
+                setattr(self._settings, k, v)
+        self._save_settings()
+
+    # ── Import ───────────────────────────────────────────
 
     def import_from_uri(self, uri: str) -> tuple[Optional[Profile], str]:
         """
-        Импорт профиля из share-ссылки.
-        Возвращает (profile, validation_report).
+        Импорт профиля из share-ссылки (sing-box://, vless://, vmess://, ...).
+        Без валидации — сохраняет как есть.
+        Возвращает (profile, message).
         """
         try:
             name, config = parse_uri_to_config(uri)
         except Exception as e:
             return None, f"Failed to parse URI: {e}"
-
-        ok, fixed, report = validate_json_string(json.dumps(config), auto_fix=True)
-        if fixed:
-            config = fixed
 
         profile = Profile(
             name=name,
@@ -145,19 +165,17 @@ class ConfigManager:
             source_uri=uri,
         )
         self.add(profile)
-        return profile, report if report != "OK" else "Imported successfully"
+        return profile, "Imported successfully"
 
     def import_from_json(self, json_str: str, name: str = "Manual") -> tuple[Optional[Profile], str]:
-        """Импорт из сырого JSON."""
+        """Импорт из сырого JSON. Без валидации."""
         try:
             config = json.loads(json_str)
         except json.JSONDecodeError as e:
             return None, f"Invalid JSON: {e}"
 
-        # Автофикс
-        ok, fixed, report = validate_json_string(json_str, auto_fix=True)
-        if fixed:
-            config = fixed
+        if not isinstance(config, dict):
+            return None, "Config must be a JSON object"
 
         ob = config.get("outbounds", [{}])[0] if config.get("outbounds") else {}
         profile = Profile(
@@ -169,7 +187,7 @@ class ConfigManager:
             source="manual",
         )
         self.add(profile)
-        return profile, report if report != "OK" else "Imported successfully"
+        return profile, "Imported successfully"
 
     def import_from_file(self, file_path: str) -> tuple[Optional[Profile], str]:
         """Импорт из .json файла."""
@@ -182,32 +200,21 @@ class ConfigManager:
             return None, f"Failed to read file: {e}"
         return self.import_from_json(content, name=path.stem)
 
-    # ── Валидация ─────────────────────────────────────────
+    # ── Config file helpers ──────────────────────────────
 
-    def validate_profile(self, profile_id: str) -> ValidationResult:
-        """Валидирует конфиг конкретного профиля."""
+    def get_config_path(self, profile_id: str) -> Path:
+        return self.config_dir / f"{profile_id}.json"
+
+    def write_active_config(self, profile_id: str) -> Optional[Path]:
         p = self.get(profile_id)
         if not p:
-            vr = ValidationResult(valid=False)
-            vr.issues.append(type("ValidationIssue", (), {"level": "error",
-                                "message": f"Profile {profile_id} not found"})())
-            return vr
-        from .config_validator import validate_config
-        return validate_config(p.config)
+            return None
+        self._save_config_file(p)
+        return self.get_config_path(profile_id)
 
-    def auto_fix_profile(self, profile_id: str) -> tuple[dict, str]:
-        """Применяет автофикс к профилю."""
-        p = self.get(profile_id)
-        if not p:
-            return {}, "Profile not found"
-        fixed, report = auto_fix_config(json.dumps(p.config))
-        self.update(profile_id, config=fixed)
-        return fixed, report
-
-    # ── Internals ─────────────────────────────────────────
+    # ── Internals ────────────────────────────────────────
 
     def _save_config_file(self, profile: Profile):
-        """Сохраняет конфиг профиля в отдельный файл."""
         fp = self.config_dir / f"{profile.id}.json"
         fp.write_text(json.dumps(profile.config, indent=2, ensure_ascii=False),
                       encoding="utf-8")
@@ -228,14 +235,18 @@ class ConfigManager:
         self.profiles_file.write_text(json.dumps(data, indent=2, ensure_ascii=False),
                                       encoding="utf-8")
 
-    def get_config_path(self, profile_id: str) -> Path:
-        """Возвращает путь к файлу конфига для передачи в sing-box."""
-        return self.config_dir / f"{profile_id}.json"
+    def _load_settings(self):
+        if not self.settings_file.exists():
+            self._settings = AppSettings()
+            return
+        try:
+            data = json.loads(self.settings_file.read_text(encoding="utf-8"))
+            self._settings = AppSettings.from_dict(data)
+        except Exception:
+            self._settings = AppSettings()
 
-    def write_active_config(self, profile_id: str) -> Optional[Path]:
-        """Сохраняет конфиг и возвращает путь к файлу (для sing-box run -c)."""
-        p = self.get(profile_id)
-        if not p:
-            return None
-        self._save_config_file(p)
-        return self.get_config_path(profile_id)
+    def _save_settings(self):
+        self.settings_file.write_text(
+            json.dumps(self._settings.to_dict(), indent=2, ensure_ascii=False),
+            encoding="utf-8"
+        )

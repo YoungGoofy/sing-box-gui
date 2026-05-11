@@ -1,0 +1,55 @@
+name: Build Windows EXE
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:  # Ручной запуск
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      # Опционально: скачать sing-box.exe и положить в корень
+      # - name: Download sing-box core
+      #   run: |
+      #     curl -L -o sing-box.zip "https://github.com/SagerNet/sing-box/releases/download/v1.11.0/sing-box-windows-amd64.zip"
+      #     7z x sing-box.zip -osing-box-tmp
+      #     move sing-box-tmp\sing-box.exe .
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller sing-box-gui.spec
+
+      - name: List output
+        run: |
+          dir dist\
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SingBoxGUI
+          path: dist/SingBoxGUI.exe
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          files: dist/SingBoxGUI.exe
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
